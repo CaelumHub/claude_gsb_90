@@ -86,8 +86,9 @@
     recommend: (id, p) => request("GET", "/api/recommend/" + id + qs(p)),
     recommendMany: (ids, k) => request("POST", "/api/recommend", { ids, k }),
 
-    // 统计 / 设置 / 标签
+    // 统计 / 时间演化 / 设置 / 标签
     stats: () => request("GET", "/api/stats"),
+    timeline: (p) => request("GET", "/api/timeline" + qs(p)),
     settings: () => request("GET", "/api/settings"),
     saveSettings: (b) => request("PUT", "/api/settings", b),
     resetSettings: () => request("POST", "/api/settings/reset"),

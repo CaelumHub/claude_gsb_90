@@ -19,6 +19,7 @@
         { key: "import",     ico: "⇄", label: "关系导入",      href: "import.html" },
         { key: "path",       ico: "🧭", label: "路径与共同好友", href: "path.html" },
         { key: "community",  ico: "◈", label: "社群发现",      href: "community.html" },
+        { key: "timeline",   ico: "⏱", label: "时间演化",      href: "timeline.html" },
       ],
     },
     {
@@ -44,6 +45,7 @@
     import: ["关系导入", "批量导入边 · 增量更新"],
     path: ["路径与共同好友", "BFS 最短路径 · 共同好友查询"],
     community: ["社群发现", "Louvain 结果着色"],
+    timeline: ["时间演化", "节点/边累计曲线 · 区间增量"],
     recommend: ["个性化推荐", "协同过滤 · 图嵌入 · 冷启动与多样性"],
     users: ["用户管理", "用户 CRUD 与画像"],
     tags: ["标签管理", "标签体系与关联"],

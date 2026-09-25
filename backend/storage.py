@@ -80,6 +80,13 @@ def _user_shard(user_id: int) -> int:
     return (user_id * 2654435761) % config.SHARD_COUNT
 
 
+def valid_timestamp(value) -> bool:
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Index
 # ---------------------------------------------------------------------------
@@ -229,10 +236,21 @@ class GraphStore:
         return g
 
     def iter_all_edges(self) -> Iterator[Tuple[int, int, float]]:
+        for u, v, w, _ts in self.iter_all_edge_records():
+            yield u, v, w
+
+    def iter_all_edge_records(self) -> Iterator[Tuple[int, int, float, int]]:
+        """Stream every persisted edge with its relationship timestamp."""
         for shard_id in range(config.SHARD_COUNT):
             data = _load_shard(shard_id)
-            for u, v, w, _ts in data["edges"]:
-                yield int(u), int(v), float(w)
+            for record in data["edges"]:
+                # Older shard files may contain three-field records.
+                if len(record) >= 4 and valid_timestamp(record[3]):
+                    u, v, w, ts = record[0], record[1], record[2], int(record[3])
+                else:
+                    u, v, w = record[0], record[1], record[2]
+                    ts = config.now_ms()
+                yield int(u), int(v), float(w), ts
 
     def neighborhood_graph(self, root: int, depth: int, limit: int) -> Graph:
         """Extract the induced subgraph around ``root`` up to ``depth`` hops."""
@@ -274,43 +292,100 @@ class GraphStore:
         return out
 
     # ---- incremental import ----------------------------------------------
-    def import_edges(self, edges: Iterable[Tuple[int, int, float]]) -> dict:
+    def import_edges(self, edges: Iterable[Tuple]) -> dict:
         """Append edges to shards and refresh the index incrementally.
 
-        Strategy: buffer edges into per-shard pending lists, then flush each
-        touched shard by merging pending edges with the existing edge list,
-        sorting and deduplicating.  Returns import statistics.
+        Accepted edge tuples are ``(u, v, w)`` or ``(u, v, w, timestamp_ms)``.
+        The timestamp is the relationship's event time and must therefore be
+        preserved independently of file update time.  Relationships are
+        canonicalised/deduplicated before writing so timeline counts match the
+        true undirected graph.
         """
-        pending: Dict[int, List[Tuple[int, int, float]]] = defaultdict(list)
+        pending: Dict[int, List[Tuple[int, int, float, int]]] = defaultdict(list)
+        canonical: Dict[Tuple[int, int], Tuple[float, int]] = {}
         skipped = 0
         self_loops = 0
-        for u, v, w in edges:
-            u, v = int(u), int(v)
+        now = config.now_ms()
+        submitted = 0
+        invalid = 0
+        for edge in edges:
+            submitted += 1
+            try:
+                u, v = int(edge[0]), int(edge[1])
+                w = float(edge[2]) if len(edge) > 2 and edge[2] is not None else 1.0
+            except (TypeError, ValueError, IndexError):
+                invalid += 1
+                continue
             if u == v:
                 self_loops += 1
                 continue
-            su = _user_shard(u)
-            pending[su].append((u, v, float(w)))
+            if u > v:
+                u, v = v, u
+            ts = int(edge[3]) if len(edge) > 3 and valid_timestamp(edge[3]) else now
+            key = (u, v)
+            old = canonical.get(key)
+            if old is None:
+                canonical[key] = (w, ts)
+            else:
+                skipped += 1
+                # Re-importing history must not overwrite the actual first time.
+                canonical[key] = (w, min(ts, old[1]))
+
+        for (u, v), (w, ts) in canonical.items():
+            pending[_user_shard(u)].append((u, v, w, ts))
 
         touched_shards: List[Tuple[int, int, int]] = []
+        imported = 0
         for shard_id, new_edges in pending.items():
             data = _load_shard(shard_id)
-            ts = config.now_ms()
-            for u, v, w in new_edges:
-                data["edges"].append([u, v, w, ts])
+            existing: Dict[Tuple[int, int], Tuple[float, int]] = {}
+            for record in data["edges"]:
+                try:
+                    u, v = int(record[0]), int(record[1])
+                    w = float(record[2])
+                    old_ts = int(record[3]) if len(record) > 3 and valid_timestamp(record[3]) else now
+                except (TypeError, ValueError, IndexError):
+                    skipped += 1
+                    continue
+                if u > v:
+                    u, v = v, u
+                if u == v:
+                    self_loops += 1
+                    continue
+                prev = existing.get((u, v))
+                if prev is None:
+                    existing[(u, v)] = (w, old_ts)
+                else:
+                    skipped += 1
+                    existing[(u, v)] = (w, min(old_ts, prev[1]))
+            for u, v, w, ts in new_edges:
+                if (u, v) in existing:
+                    skipped += 1
+                else:
+                    imported += 1
+                prev = existing.get((u, v))
+                existing[(u, v)] = (w, min(ts, prev[1]) if prev else ts)
+            data["edges"] = [
+                [u, v, w, ts]
+                for (u, v), (w, ts) in sorted(existing.items(), key=lambda item: (item[0][0], item[0][1], item[1][1]))
+            ]
+            for u, v, _w, _ts in data["edges"]:
                 data["users"].setdefault(str(u), {"name": str(u)})
                 data["users"].setdefault(str(v), {"name": str(v)})
-            data["edges"].sort(key=lambda e: (e[0], e[1]))
             _write_shard(shard_id, data)
             touched_shards.append((shard_id, len(data["users"]), len(data["edges"])))
 
-        self._refresh_index(touched_shards)
-        imported = 0
-        for _shard_id, edge_list in pending.items():
-            imported += len(edge_list)
+        # Canonical imports can move an edge to its owner shard; rebuild from
+        # disk so mappings and counts cannot retain a stale duplicate.
+        fresh_index = rebuild_index_from_shards()
+        self.index = fresh_index
+        canonical_edges = len(canonical)
         return {
+            "submitted": submitted,
             "imported": imported,
-            "skipped": 0,
+            "duplicates": max(0, canonical_edges - imported),
+            "invalid": invalid,
+            "skipped": skipped + invalid,
             "self_loops": self_loops,
             "touched_shards": len(touched_shards),
         }
@@ -332,9 +407,6 @@ class GraphStore:
             data = _load_shard(shard_id)
             edge_count = len(data["edges"])
             total_edges += edge_count
-            if config.INDEX_EDGE_COUNT_INCLUDE_USERS:
-                user_count = len(data["users"])
-                total_edges += user_count
         self.index.meta["node_count"] = total_nodes
         self.index.meta["edge_count"] = total_edges
         self.index.meta["built_at"] = config.now_ms()
@@ -348,19 +420,40 @@ class GraphStore:
         incremental imports, shards accumulate duplicate/redundant entries and
         the index drifts; a merge rewrites everything in canonical form.
         """
-        merged_edges: Dict[int, Dict[Tuple[int, int], Tuple[float, int]]] = defaultdict(dict)
-        node_shard: Dict[int, int] = {}
+        global_edges: Dict[Tuple[int, int], Tuple[float, int]] = {}
         removed = 0
         for shard_id in range(config.SHARD_COUNT):
             data = _load_shard(shard_id)
-            for u, v, w, ts in data["edges"]:
-                key = (int(u), int(v))
-                if key in merged_edges[shard_id]:
-                    removed += 1  # duplicate within shard
-                merged_edges[shard_id][key] = (float(w), int(ts))
-                node_shard[int(u)] = shard_id
-                node_shard[int(v)] = shard_id
-        # Rewrite each shard.
+            for record in data["edges"]:
+                try:
+                    raw_u, raw_v = int(record[0]), int(record[1])
+                    w = float(record[2])
+                    ts = int(record[3]) if len(record) > 3 and valid_timestamp(record[3]) else config.now_ms()
+                except (TypeError, ValueError, IndexError):
+                    removed += 1
+                    continue
+                if raw_u == raw_v:
+                    removed += 1
+                    continue
+                key = (min(raw_u, raw_v), max(raw_u, raw_v))
+                if key in global_edges:
+                    removed += 1
+                    old_w, old_ts = global_edges[key]
+                    global_edges[key] = (w, min(old_ts, ts))
+                else:
+                    global_edges[key] = (w, ts)
+
+        merged_edges: Dict[int, Dict[Tuple[int, int], Tuple[float, int]]] = defaultdict(dict)
+        for (u, v), value in global_edges.items():
+            merged_edges[_user_shard(u)][(u, v)] = value
+        # Edges are assigned to the canonical owner shard by minimum endpoint;
+        # clear old files so an edge moved from a non-canonical shard cannot
+        # survive as a duplicate.
+        for shard_id in range(config.SHARD_COUNT):
+            path = _shard_path(shard_id)
+            if os.path.exists(path):
+                os.remove(path)
+        # Rewrite every touched shard into the canonical owner shard.
         for shard_id, edge_map in merged_edges.items():
             data = {
                 "shard": shard_id,

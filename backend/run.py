@@ -31,7 +31,7 @@ else:
 
 def _check() -> int:
     """Run a smoke test over the algorithm stack; exit 0 on success."""
-    from backend import algorithms
+    from backend import algorithms, timeline
     from backend.graph import Graph
 
     g = Graph(directed=False)
@@ -57,7 +57,22 @@ def _check() -> int:
     rec = algorithms.hybrid_recommend(g, 1, k=3)
     assert "items" in rec
 
-    print("[check] OK: graph, bfs, pagerank, louvain, recommend all pass")
+    evolution = timeline.build_timeline(
+        [(1, 1000, "user", "a", 1000), (2, 2000, "edge", "2", None)],
+        [(2, 1, 2000), (1, 2, 1500)],
+        granularity="hour",
+    )
+    assert evolution["summary"]["total_nodes"] == 2
+    assert evolution["summary"]["total_edges"] == 1
+    assert evolution["interval"]["new_edge_count"] == 1
+    assert evolution["series"][-1]["edges"] == 1
+    assert timeline.build_timeline(
+        [(2, 2000, "edge", "2", None), (1, 1000, "user", "a", 1000)],
+        [(1, 2, 1500), (2, 1, 2000)],
+        granularity="hour",
+    ) == evolution
+
+    print("[check] OK: graph, bfs, pagerank, louvain, recommend, timeline all pass")
     return 0
 
 

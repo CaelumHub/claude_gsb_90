@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>时间演化 · 社交网络图分析</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar"></aside>
+    <main id="main">
+      <header id="topbar"></header>
+      <section id="content">
+        <div class="page-head">
+          <div>
+            <h1>时间演化</h1>
+            <p class="desc">基于用户创建时间与关系时间，还原节点数、边数的累计增长，并按同一时间口径统计区间增量。</p>
+          </div>
+          <button class="btn" id="btnRefresh">刷新</button>
+        </div>
+
+        <div class="card">
+          <div class="card-title">时间区间与聚合</div>
+          <div class="card-body">
+            <div class="timeline-controls">
+              <label>开始 <input type="date" id="startDate" class="input"></label>
+              <label>结束 <input type="date" id="endDate" class="input"></label>
+              <label>粒度
+                <select id="granularity" class="select">
+                  <option value="auto">自动</option>
+                  <option value="hour">小时</option>
+                  <option value="day">天</option>
+                  <option value="week">周（周一起）</option>
+                  <option value="month">月</option>
+                  <option value="year">年</option>
+                </select>
+              </label>
+              <button class="btn btn-sm" data-range="7">近 7 天</button>
+              <button class="btn btn-sm" data-range="30">近 30 天</button>
+              <button class="btn btn-sm" data-range="90">近 90 天</button>
+              <button class="btn btn-sm" data-range="all">全部</button>
+              <button class="btn btn-primary btn-sm" id="btnApply">应用区间</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid cols-4 mt-16" id="tiles"></div>
+
+        <div class="card mt-16">
+          <div class="card-head">
+            <div class="card-title">累计增长曲线 <span class="sub" id="chartSub"></span></div>
+            <div class="legend">
+              <span><i class="dot node"></i>累计节点</span>
+              <span><i class="dot edge"></i>累计边</span>
+              <span><i class="dot user"></i>新增用户关键点</span>
+              <span><i class="dot rel"></i>新增关系关键点</span>
+              <span><i class="dot"></i>新增节点关键点</span>
+            </div>
+          </div>
+          <div class="chart-host">
+            <div id="chartBox" class="chart-box"></div>
+            <div id="tooltip" class="chart-tooltip"></div>
+          </div>
+        </div>
+
+        <div class="grid cols-2 mt-16">
+          <div class="card">
+            <div class="card-title">分桶增量</div>
+            <div id="bucketList" class="card-body bucket-list"></div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <div class="card-title">区间明细</div>
+              <div class="timeline-tabs">
+                <button class="btn btn-sm active" data-tab="new_registered_users">新增用户</button>
+                <button class="btn btn-sm" data-tab="new_nodes">新增节点</button>
+                <button class="btn btn-sm" data-tab="new_edges">新增关系</button>
+              </div>
+            </div>
+            <div id="detailList" class="card-body detail-list"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="js/api.js"></script>
+  <script src="js/common.js"></script>
+  <script>
+    const C = common;
+    let timelineData = null;
+    let activeTab = "new_registered_users";
+
+    function tzOffset() { return -new Date().getTimezoneOffset(); }
+    function toDateInput(ms) {
+      const d = new Date(ms);
+      const p = (n) => String(n).padStart(2, "0");
+      return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+    }
+    function dayStart(value) { return new Date(value + "T00:00:00").getTime(); }
+    function dayEnd(value) { return dayStart(value) + 86399999; }
+    function fmtTime(ms) {
+      if (!ms) return "—";
+      return new Date(ms).toLocaleString("zh-CN", { hour12: false });
+    }
+
+    function renderTiles(d) {
+      const iv = d.interval || {};
+      const tiles = [
+        { label: "区间新增用户", value: C.fmt(iv.new_registered_user_count), hint: "有创建时间的用户档案" },
+        { label: "区间新增节点", value: C.fmt(iv.new_node_count), hint: "用户档案 ∪ 关系端点" },
+        { label: "区间新增边", value: C.fmt(iv.new_edge_count), hint: "无向关系去重后计数" },
+        { label: "期末规模", value: C.fmt(iv.end_node_count) + " / " + C.fmt(iv.end_edge_count), hint: "节点 / 边" },
+      ];
+      document.getElementById("tiles").innerHTML = tiles.map((t) =>
+        '<div class="card stat-tile"><div class="label">' + t.label + "</div>" +
+        '<div class="value">' + t.value + "</div><div class=\"hint\">" + t.hint + "</div></div>"
+      ).join("");
+    }
+
+    function linePath(points) {
+      return points.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ");
+    }
+
+    function renderChart(d) {
+      const box = document.getElementById("chartBox");
+      const series = d.series || [];
+      document.getElementById("chartSub").textContent =
+        series.length ? "聚合粒度：" + ({hour:"小时",day:"天",week:"周",month:"月",year:"年"}[d.granularity]) : "";
+      if (!series.length) {
+        box.innerHTML = C.emptyState("⏱", "所选区间没有时间数据");
+        return;
+      }
+
+      const W = 980, H = 380, M = { l: 58, r: 58, t: 26, b: 54 };
+      const iw = W - M.l - M.r, ih = H - M.t - M.b;
+      const maxNodes = Math.max(1, ...series.map((b) => b.nodes));
+      const maxEdges = Math.max(1, ...series.map((b) => b.edges));
+      const x = (i) => M.l + (series.length === 1 ? iw / 2 : i * iw / (series.length - 1));
+      const yn = (v) => M.t + ih - (v / maxNodes) * ih;
+      const ye = (v) => M.t + ih - (v / maxEdges) * ih;
+      const nodePts = series.map((b, i) => [x(i), yn(b.nodes)]);
+      const edgePts = series.map((b, i) => [x(i), ye(b.edges)]);
+
+      let grid = "";
+      for (let i = 0; i <= 4; i++) {
+        const y = M.t + ih * i / 4;
+        const nv = Math.round(maxNodes * (1 - i / 4));
+        const ev = Math.round(maxEdges * (1 - i / 4));
+        grid += '<line x1="' + M.l + '" y1="' + y + '" x2="' + (W - M.r) + '" y2="' + y + '" class="axis-grid"/>' +
+                '<text x="' + (M.l - 8) + '" y="' + (y + 4) + '" text-anchor="end" class="axis-text node-text">' + nv + "</text>" +
+                '<text x="' + (W - M.r + 8) + '" y="' + (y + 4) + '" class="axis-text edge-text">' + ev + "</text>";
+      }
+      const tickCount = Math.min(8, series.length);
+      let ticks = "";
+      for (let i = 0; i < tickCount; i++) {
+        const idx = Math.round(i * (series.length - 1) / Math.max(1, tickCount - 1));
+        ticks += '<text x="' + x(idx) + '" y="' + (H - 20) + '" text-anchor="middle" class="axis-text">' +
+                 C.escapeHtml(series[idx].label) + "</text>";
+      }
+
+      const markerIcon = { first_user: "👤", range_first_user: "👤", peak_users: "👤", first_edge: "🔗", range_first_edge: "🔗", peak_edges: "🔗", peak_nodes: "●" };
+      let markers = "";
+      (d.markers || []).forEach((m) => {
+        let idx = series.findIndex((b) => m.time >= b.bucket_start && m.time < b.bucket_end);
+        if (idx < 0) idx = series.length - 1;
+        const useNode = m.type.indexOf("edge") < 0;
+        let value;
+        if (useNode) value = series[idx].nodes;
+        else value = series[idx].edges;
+        const y = useNode ? yn(value) : ye(Math.min(value, maxEdges));
+        const markerColor = {
+          first_user: "var(--warning)", range_first_user: "var(--warning)", peak_users: "var(--warning)",
+          first_edge: "var(--danger)", range_first_edge: "var(--danger)", peak_edges: "var(--danger)",
+          peak_nodes: "var(--brand)"
+        }[m.type] || "var(--text-muted)";
+        markers += '<g class="marker ' + C.escapeHtml(m.type) + '" data-i="' + idx + '">' +
+                   '<circle cx="' + x(idx) + '" cy="' + y + '" r="12" class="marker-hit"/>' +
+                   '<text x="' + x(idx) + '" y="' + (y + 5) + '" text-anchor="middle" class="marker-icon" style="fill:' + markerColor + '">' +
+                   markerIcon[m.type] + "</text></g>";
+      });
+
+      box.innerHTML =
+        '<svg viewBox="0 0 ' + W + " " + H + '" class="timeline-svg" role="img" aria-label="节点数和边数累计增长曲线">' +
+        grid + ticks +
+        '<path d="' + linePath(nodePts) + '" class="series-line node-line" />' +
+        '<path d="' + linePath(edgePts) + '" class="series-line edge-line" />' +
+        nodePts.map((p) => '<circle cx="' + p[0] + '" cy="' + p[1] + '" r="3.2" class="series-dot node-dot"/>').join("") +
+        edgePts.map((p) => '<circle cx="' + p[0] + '" cy="' + p[1] + '" r="3.2" class="series-dot edge-dot"/>').join("") +
+        markers +
+        '<line id="hoverLine" x1="0" x2="0" y1="' + M.t + '" y2="' + (M.t + ih) + '" class="hover-line" visibility="hidden"/>' +
+        "</svg>";
+
+      const svg = box.querySelector("svg");
+      const hoverLine = svg.querySelector("#hoverLine");
+      const tip = document.getElementById("tooltip");
+      svg.addEventListener("mousemove", (e) => {
+        const rect = svg.getBoundingClientRect();
+        const px = (e.clientX - rect.left) * W / rect.width;
+        if (px < M.l || px > W - M.r) { tip.style.display = "none"; hoverLine.setAttribute("visibility", "hidden"); return; }
+        const ratio = (px - M.l) / iw;
+        const i = Math.max(0, Math.min(series.length - 1, Math.round(ratio * (series.length - 1))));
+        const b = series[i];
+        hoverLine.setAttribute("x1", x(i)); hoverLine.setAttribute("x2", x(i));
+        hoverLine.setAttribute("visibility", "visible");
+        tip.innerHTML = "<strong>" + C.escapeHtml(b.label) + "</strong><br>" +
+          "累计节点：<b>" + b.nodes + "</b>（新增 " + b.new_nodes + "）<br>" +
+          "累计边：<b>" + b.edges + "</b>（新增 " + b.new_edges + "）<br>" +
+          "新增注册用户：" + b.new_registered_users;
+        tip.style.display = "block";
+        const tx = Math.min(rect.width - 190, Math.max(8, (x(i) / W) * rect.width + 12));
+        tip.style.left = tx + "px";
+        tip.style.top = "20px";
+      });
+      svg.addEventListener("mouseleave", () => { tip.style.display = "none"; hoverLine.setAttribute("visibility", "hidden"); });
+    }
+
+    function renderBuckets(d) {
+      const rows = (d.series || []).filter((b) => b.new_nodes || b.new_edges || b.new_registered_users);
+      const box = document.getElementById("bucketList");
+      if (!rows.length) { box.innerHTML = C.emptyState("📭", "区间内没有增量"); return; }
+      C.renderTable(box, [
+        { label: "时间桶", render: (r) => C.escapeHtml(r.label) },
+        { label: "新增用户", key: "new_registered_users", align: "right" },
+        { label: "新增节点", key: "new_nodes", align: "right" },
+        { label: "新增边", key: "new_edges", align: "right" },
+        { label: "累计节点", key: "nodes", align: "right" },
+        { label: "累计边", key: "edges", align: "right" },
+      ], rows);
+    }
+
+    function renderDetails(d) {
+      const box = document.getElementById("detailList");
+      const details = d.details || {};
+      if (activeTab === "new_registered_users") {
+        const rows = details.new_registered_users || [];
+        C.renderTable(box, [
+          { label: "时间", render: (r) => fmtTime(r.time) },
+          { label: "ID", key: "id", align: "right" },
+          { label: "名称", render: (r) => C.escapeHtml(r.name) },
+        ], rows);
+      } else if (activeTab === "new_nodes") {
+        const rows = details.new_nodes || [];
+        C.renderTable(box, [
+          { label: "首次出现", render: (r) => fmtTime(r.time) },
+          { label: "ID", key: "id", align: "right" },
+          { label: "名称", render: (r) => C.escapeHtml(r.name) },
+          { label: "来源", render: (r) => r.source === "user" ? "用户创建" : "关系端点" },
+        ], rows);
+      } else {
+        const rows = details.new_edges || [];
+        C.renderTable(box, [
+          { label: "时间", render: (r) => fmtTime(r.time) },
+          { label: "关系", render: (r) => r.from + " ↔ " + r.to },
+        ], rows);
+      }
+      const total = d.interval ? d.interval[
+        activeTab === "new_registered_users" ? "new_registered_user_count" :
+        activeTab === "new_nodes" ? "new_node_count" : "new_edge_count"
+      ] : 0;
+      if (total > (details.limit || 0)) {
+        box.insertAdjacentHTML("beforeend", '<p class="muted table-note">仅展示前 ' + details.limit + " 条；区间内共 " + total + " 条。</p>");
+      }
+    }
+
+    async function load(params) {
+      document.getElementById("chartBox").innerHTML = C.spinner();
+      try {
+        timelineData = await api.timeline(Object.assign({
+          tz_offset: tzOffset(),
+          detail_limit: 100,
+        }, params || {}));
+        renderTiles(timelineData);
+        renderChart(timelineData);
+        renderBuckets(timelineData);
+        renderDetails(timelineData);
+      } catch (e) {
+        C.toast(e.message, "error");
+      }
+    }
+
+    function selectedParams() {
+      const p = { granularity: document.getElementById("granularity").value };
+      const s = document.getElementById("startDate").value;
+      const e = document.getElementById("endDate").value;
+      if (s) p.start = dayStart(s);
+      if (e) p.end = dayEnd(e);
+      return p;
+    }
+
+    function setQuickRange(days) {
+      const end = timelineData && timelineData.data_end ? timelineData.data_end : Date.now();
+      const start = end - days * 86400000;
+      document.getElementById("startDate").value = toDateInput(start);
+      document.getElementById("endDate").value = toDateInput(end);
+    }
+
+    C.initPage("timeline", async function () {
+      document.getElementById("btnApply").addEventListener("click", () => load(selectedParams()));
+      document.getElementById("btnRefresh").addEventListener("click", () => load(selectedParams()));
+      document.querySelectorAll("[data-range]").forEach((btn) => btn.addEventListener("click", () => {
+        if (btn.dataset.range === "all") {
+          document.getElementById("startDate").value = "";
+          document.getElementById("endDate").value = "";
+          load({ granularity: document.getElementById("granularity").value });
+        } else {
+          setQuickRange(Number(btn.dataset.range));
+          load(selectedParams());
+        }
+      }));
+      document.querySelectorAll("[data-tab]").forEach((btn) => btn.addEventListener("click", () => {
+        activeTab = btn.dataset.tab;
+        document.querySelectorAll("[data-tab]").forEach((b) => b.classList.toggle("active", b === btn));
+        if (timelineData) renderDetails(timelineData);
+      }));
+      await load();
+      if (timelineData && timelineData.data_start) {
+        document.getElementById("startDate").value = toDateInput(timelineData.data_start);
+        document.getElementById("endDate").value = toDateInput(timelineData.data_end);
+      }
+    });
+  </script>
+</body>
+</html>

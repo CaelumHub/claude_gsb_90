@@ -81,7 +81,10 @@ def generate_demo(
         if key in seen:
             return
         seen.add(key)
-        edges.append((u, v, round(rng.uniform(0.5, 1.0), 2)))
+        user_birth = max(users[u]["created_at"], users[v]["created_at"])
+        window = max(0, config.now_ms() - user_birth)
+        edge_time = user_birth + rng.randint(0, window)
+        edges.append((u, v, round(rng.uniform(0.5, 1.0), 2), edge_time))
 
     for uid in range(1, n_users + 1):
         cid = min((uid - 1) // cluster_size, communities - 1)
@@ -98,7 +101,7 @@ def generate_demo(
 
     # Guarantee no fully isolated nodes (avoid trivial components).
     for uid in range(1, n_users + 1):
-        if all(u != uid and v != uid for u, v, _ in edges):
+        if all(u != uid and v != uid for u, v, _w, _ts in edges):
             other = rng.randint(1, n_users)
             _add(uid, other)
 

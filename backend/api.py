@@ -18,7 +18,7 @@ Endpoint summary (all under ``/api``):
     PUT    /api/users/<id>            {name?, tags?, attributes?}
     DELETE /api/users/<id>
     GET    /api/users/<id>/neighbors  ?depth
-    POST   /api/import                {edges:[[u,v],...], source}
+    POST   /api/import                {edges:[[u,v,w,timestamp?],...], source}
     GET    /api/graph                 ?limit&community&top
     GET    /api/graph/neighborhood    ?node&depth&limit
     GET    /api/path                  ?source&target&algorithm
@@ -29,6 +29,7 @@ Endpoint summary (all under ``/api``):
     GET    /api/recommend/<id>        ?k&refresh&strategy
     POST   /api/recommend             {ids:[...], k}
     GET    /api/stats
+    GET    /api/timeline              ?start&end&granularity&tz_offset&detail_limit
     GET    /api/settings              /  PUT /api/settings
     POST   /api/settings/reset
     GET    /api/tags                  /  POST /api/tags  /  DELETE /api/tags/<name>
@@ -183,11 +184,17 @@ class ApiRouter:
             for e in edges:
                 if isinstance(e, (list, tuple)) and len(e) >= 2:
                     try:
-                        normalised.append((int(e[0]), int(e[1]), float(e[2]) if len(e) > 2 else 1.0))
+                        item = [
+                            int(e[0]),
+                            int(e[1]),
+                            float(e[2]) if len(e) > 2 and e[2] is not None else 1.0,
+                        ]
+                        if len(e) > 3 and e[3] not in (None, ""):
+                            item.append(int(e[3]))
+                        normalised.append(tuple(item))
                     except (TypeError, ValueError):
                         continue
             result = self.service.store.import_edges(normalised)
-            result["imported"] = len(edges)
             self.service.invalidate_graph()
             storage.log_import({**result, "source": source, "time": config.now_ms()})
             return 200, {**result, "source": source}
@@ -316,6 +323,25 @@ class ApiRouter:
             for uid in ids:
                 result[str(uid)] = self.service.recommend(int(uid), k=k)["items"]
             return 200, {"results": result}
+
+        # --- timeline ---
+        if route == "/timeline" and method == "GET":
+            start = _to_int(query.get("start"), 0) or None
+            end = _to_int(query.get("end"), 0) or None
+            granularity = query.get("granularity", "auto")
+            tz_offset = min(max(_to_int(query.get("tz_offset"), 0), -720), 840)
+            detail_limit = min(max(_to_int(query.get("detail_limit"), 100), 0), 1000)
+            if granularity not in ("auto", "hour", "day", "week", "month", "year"):
+                return _error("不支持的时间聚合粒度")
+            if start is not None and end is not None and start > end:
+                return _error("开始时间不能晚于结束时间")
+            return 200, self.service.timeline(
+                start=start,
+                end=end,
+                granularity=granularity,
+                tz_offset_minutes=tz_offset,
+                detail_limit=detail_limit,
+            )
 
         # --- stats ---
         if route == "/stats" and method == "GET":

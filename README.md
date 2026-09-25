@@ -1,8 +1,8 @@
 # 社交网络图分析与推荐系统
 
 一个 **零第三方依赖**（Python 后端纯标准库，前端仅引 vis.js CDN）的社交网络图分析
-与推荐系统。前端 10 个页面覆盖用户管理、关系导入、图可视化、路径与共同好友、
-社群发现、个性化推荐、统计面板、系统设置、数据导出与标签管理；后端实现邻接表图
+与推荐系统。前端 11 个页面覆盖用户管理、关系导入、图可视化、路径与共同好友、
+社群发现、时间演化、个性化推荐、统计面板、系统设置、数据导出与标签管理；后端实现邻接表图
 构建、BFS 最短路径、PageRank、Louvain 社群划分，以及协同过滤 + 图嵌入 + 标签的
 混合推荐。
 
@@ -45,23 +45,25 @@ gsb3/
 │   ├── config.py               # 配置、设置存储、路径、原子写工具
 │   ├── graph.py                # 内存高效 CSR 图（邻接表冻结为压缩数组）
 │   ├── algorithms.py           # BFS/双向BFS、PageRank、Louvain、推荐算法
+│   ├── timeline.py             # 纯时间聚合：累计曲线、区间增量、关键时间点
 │   ├── storage.py              # 分片 JSON 邻接表存储、索引、增量合并
 │   ├── service.py              # 业务服务层（缓存、CRUD、算法调度）
 │   ├── api.py                  # HTTP 服务 + REST 路由 + 静态托管
 │   ├── seed.py                 # 演示数据生成器
 │   └── run.py                  # 入口（含 --check / --seed）
-├── frontend/                   # 前端（10 页面 + 共享资源）
+├── frontend/                   # 前端（11 页面 + 共享资源）
 │   ├── index.html              # 入口（跳转 graph.html）
 │   ├── users.html              # 1. 用户管理
 │   ├── import.html             # 2. 关系导入
 │   ├── graph.html              # 3. 图可视化（vis.js 缩放拖拽、路径高亮）
 │   ├── path.html               # 4. 最短路径与共同好友查询
 │   ├── community.html          # 5. 社群发现（Louvain 着色）
-│   ├── recommend.html          # 6. 个性化推荐列表
-│   ├── stats.html              # 7. 统计面板
-│   ├── settings.html           # 8. 系统设置
-│   ├── export.html             # 9. 数据导出
-│   ├── tags.html               # 10. 标签管理
+│   ├── timeline.html           # 6. 时间演化（累计曲线、区间增量）
+│   ├── recommend.html          # 7. 个性化推荐列表
+│   ├── stats.html              # 8. 统计面板
+│   ├── settings.html           # 9. 系统设置
+│   ├── export.html             # 10. 数据导出
+│   ├── tags.html               # 11. 标签管理
 │   ├── css/style.css           # 设计系统（明暗双主题）
 │   └── js/                     # api.js（客户端）+ common.js（外壳/工具）
 └── data/                       # 运行期生成（分片图、画像、推荐、社群…）
@@ -98,7 +100,14 @@ gsb3/
 - **合并 / 索引重建**：`merge_shards()` 全量重写为规范形式（排序、去重），随后
   `rebuild_index_from_shards()` 重建唯一节点计数与分片映射。
 
-### 3. 算法（`algorithms.py`）
+### 3. 时间演化（`timeline.py`）
+
+- 聚合逻辑与前端展示分离：输入统一的节点/边事件，输出可复用的 JSON 序列。
+- 所有时间均为 Unix 毫秒时间戳；时间桶为左闭右开，查询区间为闭区间，时区偏移由前端显式传入。
+- 无向边按 `(min(u,v), max(u,v))` 全局去重并保留最早关系时间；节点取“用户创建时间 / 首次出现在关系中的时间”的较早者。
+- 输出每个桶的新增与累计值、首位用户/首条关系/增量峰值标记，以及所选区间内新增用户、节点、关系明细。
+
+### 4. 算法（`algorithms.py`）
 
 | 算法 | 实现要点 |
 | --- | --- |
@@ -110,7 +119,7 @@ gsb3/
 | 冷启动 | 好友数低于阈值时退化为「热门 + 标签重叠」 |
 | 多样性 | MMR 最大边际相关性重排序，λ 权衡相关性与多样性 |
 
-### 4. 数据分层
+### 5. 数据分层
 
 图数据（分片邻接表）与派生数据（`recommendations.json` / `profiles.json` /
 `community.json` / `pagerank.json`）**分开存储**：图变更只触发图分片的增量写与索引
@@ -135,6 +144,7 @@ gsb3/
 | GET | `/api/pagerank?top=` | PageRank 中心性 |
 | GET/POST | `/api/recommend/<id>` · `/api/recommend` | 单用户 / 批量推荐 |
 | GET | `/api/stats` | 统计面板聚合 |
+| GET | `/api/timeline?start&end&granularity&tz_offset&detail_limit` | 时间演化曲线、关键时间点与区间增量 |
 | GET/PUT | `/api/settings` | 读取 / 保存设置 |
 | GET/POST/DELETE | `/api/tags` | 标签管理 |
 | GET | `/api/export?format=json\|graphml\|csv` | 导出 |

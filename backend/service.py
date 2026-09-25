@@ -23,7 +23,7 @@ from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
 try:
-    from . import algorithms, config, storage
+    from . import algorithms, config, storage, timeline
     from .algorithms import (
         adamic_adar,
         bidirectional_shortest_path,
@@ -41,6 +41,7 @@ except ImportError:  # pragma: no cover
     import algorithms
     import config
     import storage
+    import timeline
     from algorithms import (  # type: ignore
         adamic_adar,
         bidirectional_shortest_path,
@@ -73,6 +74,7 @@ class SocialGraphService:
         self._rec_cache: Dict[int, dict] = self.derived.load_recommendations()
         self._community_dirty = False
         self._pagerank_dirty = False
+        self._timeline_cache: Dict[tuple, dict] = {}
 
     # ------------------------------------------------------------------
     # Graph access / caching
@@ -86,6 +88,7 @@ class SocialGraphService:
                 # Graph changed -> derived results are stale.
                 self._community_dirty = True
                 self._pagerank_dirty = True
+                self._timeline_cache.clear()
             return self._graph
 
     def invalidate_graph(self) -> None:
@@ -94,11 +97,14 @@ class SocialGraphService:
             self._graph_dirty = True
             self._community_dirty = False
             self._pagerank_dirty = True
+            self._timeline_cache.clear()
 
     def graph_stats(self) -> dict:
         graph = self.get_graph()
         n = graph.node_count
-        m = self.store.index.meta.get("edge_count", graph.edge_count)
+        # The frozen graph has canonicalised undirected edges; stale index files
+        # from older imports may include denormalised duplicate records.
+        m = graph.edge_count
         degrees = [graph.degree(nid) for nid in graph.nodes]
         avg = (sum(degrees) / n) if n else 0.0
         density = (2.0 * m / (n * (n - 1))) if n > 1 else 0.0
@@ -227,6 +233,7 @@ class SocialGraphService:
         }
         users[uid] = user
         self.store.save_users(users)
+        self._timeline_cache.clear()
         self._register_tags(tags or [])
         return {"id": uid, **user}
 
@@ -243,6 +250,7 @@ class SocialGraphService:
         if "attributes" in patch:
             u["attributes"] = {**u.get("attributes", {}), **patch["attributes"]}
         self.store.save_users(users)
+        self._timeline_cache.clear()
         # Invalidate recommendations since tags may change recommendations.
         self._rec_cache.pop(uid, None)
         return {"id": uid, **u}
@@ -255,8 +263,8 @@ class SocialGraphService:
         self.store.save_users(users)
         # Remove incident edges: rebuild graph without this node.
         edges = [
-            (u, v, w)
-            for u, v, w in self.store.iter_all_edges()
+            (u, v, w, ts)
+            for u, v, w, ts in self.store.iter_all_edge_records()
             if u != uid and v != uid
         ]
         self._rewrite_all_edges(edges)
@@ -550,6 +558,79 @@ class SocialGraphService:
             },
             "generated_at": config.now_ms(),
         }
+
+    # ------------------------------------------------------------------
+    # Timeline aggregation
+    # ------------------------------------------------------------------
+    def _collect_timeline_events(self):
+        users = self.store.load_users()
+        node_first: Dict[int, Tuple[int, str, str, Optional[int]]] = {}
+
+        def touch(node_id: int, ts: int, source: str, name: Optional[str] = None) -> None:
+            if not ts or ts <= 0:
+                return
+            old = node_first.get(node_id)
+            record_name = name or (users.get(node_id, {}).get("name", str(node_id)))
+            candidate = (ts, source, record_name, None)
+            if old is None or ts < old[0]:
+                node_first[node_id] = candidate
+
+        for uid, user in users.items():
+            registered = user.get("created_at_ms", user.get("created_at"))
+            try:
+                registered = int(registered)
+            except (TypeError, ValueError):
+                registered = None
+            name = user.get("name", str(uid))
+            if registered and registered > 0:
+                node_first[uid] = (registered, "user", name, registered)
+            else:
+                touch(uid, 0, "user", name)
+
+        edge_events = []
+        for u, v, _w, ts in self.store.iter_all_edge_records():
+            edge_events.append((u, v, ts))
+            touch(u, ts, "edge")
+            touch(v, ts, "edge")
+
+        # Restore registration timestamps on the retained earliest-birth tuples.
+        node_events = []
+        for uid in sorted(node_first):
+            ts, source, name, _placeholder = node_first[uid]
+            registered = users.get(uid, {}).get("created_at_ms", users.get(uid, {}).get("created_at"))
+            try:
+                registered = int(registered)
+            except (TypeError, ValueError):
+                registered = None
+            node_events.append((uid, ts, source, name, registered if registered and registered > 0 else None))
+        return node_events, edge_events
+
+    def timeline(
+        self,
+        start: Optional[int] = None,
+        end: Optional[int] = None,
+        granularity: str = "auto",
+        tz_offset_minutes: int = 0,
+        detail_limit: int = 100,
+    ) -> dict:
+        """Return cached, reusable temporal aggregation for the current graph."""
+        key = (start, end, granularity, tz_offset_minutes, detail_limit)
+        with self._lock:
+            cached = self._timeline_cache.get(key)
+            if cached is not None:
+                return cached
+            node_events, edge_events = self._collect_timeline_events()
+            result = timeline.build_timeline(
+                node_events,
+                edge_events,
+                start=start,
+                end=end,
+                granularity=granularity,
+                tz_offset_minutes=tz_offset_minutes,
+                detail_limit=detail_limit,
+            )
+            self._timeline_cache[key] = result
+            return result
 
     # ------------------------------------------------------------------
     # Stats panel

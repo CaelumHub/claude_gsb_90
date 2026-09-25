@@ -26,8 +26,8 @@
         <div class="grid cols-3">
           <div class="card" style="grid-column: span 2">
             <div class="card-title">边列表</div>
-            <p class="small muted mt-8">每行一条边，格式：<code>u v [权重]</code>，可用空格、逗号或制表符分隔。</p>
-            <textarea class="textarea mt-8" id="edgeInput" rows="12" placeholder="1 2&#10;2 3 0.8&#10;3,4&#10;1 5"></textarea>
+            <p class="small muted mt-8">每行一条边，格式：<code>u v [权重] [产生时间(毫秒)]</code>，可用空格、逗号或制表符分隔；省略时间时使用导入时刻。</p>
+            <textarea class="textarea mt-8" id="edgeInput" rows="12" placeholder="1 2&#10;2 3 0.8&#10;3,4&#10;1 5 1 1700000000000"></textarea>
           </div>
           <div class="card">
             <div class="card-title">导入结果</div>
@@ -77,7 +77,12 @@
         if (isNaN(u) || isNaN(v)) continue;
         let w = 1.0;
         if (parts.length >= 3 && !isNaN(parseFloat(parts[2]))) w = parseFloat(parts[2]);
-        edges.push([u, v, w]);
+        let edge = [u, v, w];
+        if (parts.length >= 4) {
+          const ts = parseInt(parts[3], 10);
+          if (!isNaN(ts) && ts > 0) edge.push(ts);
+        }
+        edges.push(edge);
       }
       return edges;
     }
@@ -92,7 +97,8 @@
           box.innerHTML =
             '<div class="badge success">成功</div>' +
             '<div class="mt-8">导入 <strong>' + r.imported + "</strong> 条边</div>" +
-            '<div class="mt-8">跳过重复 <strong>' + r.skipped + "</strong> 条</div>" +
+            '<div class="mt-8">跳过重复 <strong>' + (r.duplicates || 0) + "</strong> 条</div>" +
+            '<div class="mt-8">无效记录 <strong>' + (r.invalid || 0) + "</strong> 条</div>" +
             '<div class="mt-8">自环忽略 <strong>' + r.self_loops + "</strong> 条</div>" +
             '<div class="mt-8">触达分片 <strong>' + r.touched_shards + "</strong> 个</div>";
           C.toast("已导入 " + r.imported + " 条关系", "success");

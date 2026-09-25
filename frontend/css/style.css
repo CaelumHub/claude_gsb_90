@@ -402,3 +402,47 @@ table.table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
   #content { padding: 16px; }
 }
 .menu-toggle { display: none; }
+
+/* 时间演化页面 */
+.timeline-controls {
+  display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px;
+}
+.timeline-controls label {
+  display: flex; flex-direction: column; gap: 5px; color: var(--text-muted);
+  font-size: 12.5px; font-weight: 600;
+}
+.timeline-controls .input, .timeline-controls .select { min-width: 132px; }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; color: var(--text-muted); font-size: 12.5px; }
+.legend .dot { width: 9px; height: 9px; display: inline-block; border-radius: 50%; margin-right: 5px; background: var(--text-muted); }
+.legend .node { background: var(--brand); }
+.legend .edge { background: var(--success); }
+.legend .user { background: var(--warning); }
+.legend .rel { background: var(--danger); }
+.chart-host { position: relative; }
+.chart-box { width: 100%; overflow-x: auto; margin-top: 10px; }
+.timeline-svg { width: 100%; min-width: 680px; height: auto; display: block; }
+.axis-grid { stroke: var(--border); stroke-width: 1; }
+.axis-text { fill: var(--text-faint); font-size: 11.5px; }
+.node-text { fill: var(--brand); }
+.edge-text { fill: var(--success); }
+.series-line { fill: none; stroke-width: 2.4; vector-effect: non-scaling-stroke; }
+.node-line { stroke: var(--brand); }
+.edge-line { stroke: var(--success); }
+.series-dot { stroke: var(--bg-elevated); stroke-width: 1.2; vector-effect: non-scaling-stroke; }
+.node-dot { fill: var(--brand); }
+.edge-dot { fill: var(--success); }
+.hover-line { stroke: var(--border-strong); stroke-width: 1; stroke-dasharray: 4 4; }
+.marker-hit { fill: transparent; pointer-events: none; }
+.first_user .marker-icon, .range_first_user .marker-icon, .peak_users .marker-icon { fill: var(--warning); font-size: 13px; }
+.first_edge .marker-icon, .range_first_edge .marker-icon, .peak_edges .marker-icon { fill: var(--danger); font-size: 13px; }
+.peak_nodes .marker-icon { fill: var(--brand); }
+.chart-tooltip {
+  position: absolute; display: none; min-width: 190px; padding: 9px 11px;
+  background: var(--bg-elevated); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow-md);
+  font-size: 12.5px; pointer-events: none; z-index: 5;
+}
+.bucket-list, .detail-list { max-height: 430px; overflow-y: auto; }
+.timeline-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+.timeline-tabs .btn.active { background: var(--brand); border-color: var(--brand); color: #fff; }
+.table-note { margin: 10px 0 0; color: var(--text-faint); font-size: 12.5px; }
