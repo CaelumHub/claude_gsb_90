@@ -29,6 +29,8 @@ Endpoint summary (all under ``/api``):
     GET    /api/recommend/<id>        ?k&refresh&strategy
     POST   /api/recommend             {ids:[...], k}
     GET    /api/stats
+    GET    /api/timeline              ?granularity=auto|day|week|month&start&end
+    GET    /api/timeline/delta        ?start&end&granularity
     GET    /api/settings              /  PUT /api/settings
     POST   /api/settings/reset
     GET    /api/tags                  /  POST /api/tags  /  DELETE /api/tags/<name>
@@ -320,6 +322,26 @@ class ApiRouter:
         # --- stats ---
         if route == "/stats" and method == "GET":
             return 200, self.service.full_stats()
+
+        # --- timeline (graph evolution) ---
+        if route == "/timeline" and method == "GET":
+            granularity = query.get("granularity", "auto")
+            start = _to_int(query.get("start"), 0) or None
+            end = _to_int(query.get("end"), 0) or None
+            try:
+                return 200, self.service.get_timeline(granularity, start, end)
+            except ValueError as exc:
+                return _error(str(exc))
+        if route == "/timeline/delta" and method == "GET":
+            start = _to_int(query.get("start"), 0)
+            end = _to_int(query.get("end"), 0)
+            granularity = query.get("granularity", "auto")
+            if not start or not end or end <= start:
+                return _error("需要合法的 start/end（毫秒时间戳，且 end > start）")
+            try:
+                return 200, self.service.get_timeline_delta(start, end, granularity)
+            except ValueError as exc:
+                return _error(str(exc))
 
         # --- profiles (separately stored user profiles) ---
         if route == "/profiles" and method == "GET":

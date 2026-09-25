@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>演化分析 · 社交网络图分析</title>
+  <link rel="stylesheet" href="css/style.css">
+  <style>
+    /* 本页专用：曲线容器与提示框（通用样式都在 style.css） */
+    .curve-wrap { position: relative; }
+    #curveCanvas { width: 100%; height: 360px; display: block; cursor: crosshair; }
+    .curve-tip {
+      position: absolute; display: none; pointer-events: none; z-index: 5;
+      background: var(--bg-elevated, #fff); border: 1px solid var(--border);
+      border-radius: 8px; padding: 8px 10px; font-size: 12px; line-height: 1.7;
+      box-shadow: 0 6px 20px rgba(0,0,0,.12); white-space: nowrap;
+    }
+    .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12.5px; color: var(--text-muted); }
+    .legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
+    .milestone-list { display: flex; flex-direction: column; gap: 10px; }
+    .milestone-item { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+    .milestone-item .mono { color: var(--text-muted); }
+    .delta-bars { max-height: 320px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar"></aside>
+    <main id="main">
+      <header id="topbar"></header>
+      <section id="content">
+        <div class="page-head">
+          <div>
+            <h1>演化分析</h1>
+            <p class="desc">根据边与用户的创建时间还原图的增长过程：累计曲线、关键时间点、任意区间增量。时间口径统一为 UTC。</p>
+          </div>
+          <div class="row">
+            <select class="select" id="granularity">
+              <option value="auto">自动粒度</option>
+              <option value="day">按天</option>
+              <option value="week">按周</option>
+              <option value="month">按月</option>
+            </select>
+            <button class="btn" id="btnRefresh">刷新</button>
+          </div>
+        </div>
+
+        <div class="grid cols-4" id="tiles"></div>
+
+        <div class="card mt-16">
+          <div class="card-title">节点数 / 边数 累计增长曲线
+            <span class="sub" id="curveMeta"></span>
+          </div>
+          <div class="card-body">
+            <div class="curve-wrap">
+              <canvas id="curveCanvas"></canvas>
+              <div class="curve-tip" id="curveTip"></div>
+            </div>
+            <div class="legend mt-16" id="curveLegend"></div>
+          </div>
+        </div>
+
+        <div class="grid cols-2 mt-16">
+          <div class="card">
+            <div class="card-title">关键时间点</div>
+            <div class="card-body" id="milestones"></div>
+          </div>
+          <div class="card">
+            <div class="card-title">区间增量查询
+              <span class="sub">左闭右开 [开始, 结束)，UTC</span>
+            </div>
+            <div class="card-body">
+              <div class="row wrap">
+                <input type="datetime-local" class="input" id="rangeStart" step="60">
+                <span class="muted">至</span>
+                <input type="datetime-local" class="input" id="rangeEnd" step="60">
+                <button class="btn btn-primary" id="btnDelta">查询增量</button>
+                <button class="btn btn-ghost" id="btnFullRange">全时段</button>
+              </div>
+              <div id="deltaResult" class="mt-16"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid cols-2 mt-16" id="deltaLists" style="display:none">
+          <div class="card">
+            <div class="card-title">区间内新增用户 <span class="sub" id="newUserCount"></span></div>
+            <div class="card-body" id="newUsers" style="max-height:360px;overflow-y:auto"></div>
+          </div>
+          <div class="card">
+            <div class="card-title">区间内新增关系 <span class="sub" id="newEdgeCount"></span></div>
+            <div class="card-body" id="newEdges" style="max-height:360px;overflow-y:auto"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="js/api.js"></script>
+  <script src="js/common.js"></script>
+  <script>
+    const C = common;
+    const COL_NODES = C.PALETTE[0];   // 节点曲线
+    const COL_EDGES = C.PALETTE[1];   // 边曲线
+    const COL_MS = { first_user: "#e09a2f", peak_new_users: "#e09a2f",
+                     first_edge: "#8a63d2", peak_new_edges: "#8a63d2",
+                     latest_event: "#5b7a99" };
+    let CURVE = null;
+
+    // ------------------------------------------------------------------
+    // 时间格式化：全页统一 UTC（与后端桶标签同口径）
+    // ------------------------------------------------------------------
+    const pad2 = (x) => String(x).padStart(2, "0");
+    function fmtUtc(ms) {
+      const d = new Date(ms);
+      return d.getUTCFullYear() + "-" + pad2(d.getUTCMonth() + 1) + "-" + pad2(d.getUTCDate()) +
+             " " + pad2(d.getUTCHours()) + ":" + pad2(d.getUTCMinutes());
+    }
+    function toInputValue(ms) { return fmtUtc(ms).replace(" ", "T"); }
+    function fromInputValue(v) { return v ? Date.parse(v + ":00Z") : 0; }
+
+    // ------------------------------------------------------------------
+    // 顶部指标
+    // ------------------------------------------------------------------
+    function renderTiles(res) {
+      const t = res.totals;
+      const span = t.first_event != null
+        ? fmtUtc(t.first_event) + " ~ " + fmtUtc(t.last_event) : "—";
+      const unknown = t.edges_without_time + t.nodes_without_time + t.users_without_time;
+      const tiles = [
+        { label: "节点总数", value: C.fmt(t.nodes), hint: "users ∪ 边端点" },
+        { label: "边总数", value: C.fmt(t.edges), hint: "无向去重后，与图统计一致" },
+        { label: "注册用户", value: C.fmt(t.users), hint: "users.json 档案数" },
+        { label: "时间跨度", value: span, hint: unknown ? unknown + " 条记录缺时间未入曲线" : "首个 ~ 最近事件（UTC）" },
+      ];
+      document.getElementById("tiles").innerHTML = tiles.map((x) =>
+        '<div class="card stat-tile"><div class="label">' + x.label + '</div>' +
+        '<div class="value" style="font-size:' + (x.value.length > 12 ? "15px" : "28px") + '">' + x.value + '</div>' +
+        '<div class="hint">' + x.hint + "</div></div>"
+      ).join("");
+    }
+
+    // ------------------------------------------------------------------
+    // 累计曲线（canvas 手绘，双 Y 轴：左节点 / 右边）
+    // ------------------------------------------------------------------
+    function bucketIndexAt(buckets, ts) {
+      for (let i = 0; i < buckets.length; i++) {
+        if (ts >= buckets[i].start && ts < buckets[i].end) return i;
+      }
+      return ts < buckets[0].start ? 0 : buckets.length - 1;
+    }
+
+    function drawCurve() {
+      const canvas = document.getElementById("curveCanvas");
+      const tip = document.getElementById("curveTip");
+      const buckets = (CURVE && CURVE.buckets) || [];
+      const ctx = canvas.getContext("2d");
+      const dpr = window.devicePixelRatio || 1;
+      const W = canvas.clientWidth, H = canvas.clientHeight;
+      canvas.width = W * dpr; canvas.height = H * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, W, H);
+      if (!buckets.length) return;
+
+      const css = getComputedStyle(document.documentElement);
+      const colGrid = css.getPropertyValue("--border").trim() || "#e3e6ea";
+      const colText = css.getPropertyValue("--text-muted").trim() || "#8a8f98";
+      const padL = 52, padR = 52, padT = 14, padB = 30;
+      const iw = W - padL - padR, ih = H - padT - padB;
+      const n = buckets.length;
+      const maxN = Math.max.apply(null, buckets.map((b) => b.nodes).concat([1]));
+      const maxE = Math.max.apply(null, buckets.map((b) => b.edges).concat([1]));
+      const X = (i) => padL + (n === 1 ? iw / 2 : (i / (n - 1)) * iw);
+      const Yv = (v, mx) => padT + ih - (v / mx) * ih;
+
+      // 网格 + 双轴刻度
+      ctx.font = "11px sans-serif";
+      ctx.textBaseline = "middle";
+      for (let g = 0; g <= 4; g++) {
+        const yy = padT + (ih * g) / 4;
+        ctx.strokeStyle = colGrid; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(padL + iw, yy); ctx.stroke();
+        ctx.fillStyle = COL_NODES; ctx.textAlign = "right";
+        ctx.fillText(String(Math.round(maxN * (4 - g) / 4)), padL - 8, yy);
+        ctx.fillStyle = COL_EDGES; ctx.textAlign = "left";
+        ctx.fillText(String(Math.round(maxE * (4 - g) / 4)), padL + iw + 8, yy);
+      }
+      // X 轴标签（抽稀）
+      ctx.fillStyle = colText; ctx.textAlign = "center";
+      const step = Math.max(1, Math.ceil(n / 8));
+      for (let i = 0; i < n; i++) {
+        if (i % step === 0 || i === n - 1) ctx.fillText(buckets[i].label, X(i), H - 12);
+      }
+      // 关键时间点：竖直虚线
+      (CURVE.milestones || []).forEach((m) => {
+        const i = bucketIndexAt(buckets, m.ts);
+        ctx.strokeStyle = COL_MS[m.type] || "#c0c4cc";
+        ctx.setLineDash([4, 4]); ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(X(i), padT); ctx.lineTo(X(i), padT + ih); ctx.stroke();
+        ctx.setLineDash([]);
+      });
+      // 两条累计曲线
+      const drawLine = (vals, mx, color) => {
+        ctx.strokeStyle = color; ctx.lineWidth = 2;
+        ctx.beginPath();
+        vals.forEach((v, i) => { const x = X(i), y = Yv(v, mx); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+        ctx.stroke();
+        ctx.fillStyle = color;
+        vals.forEach((v, i) => { ctx.beginPath(); ctx.arc(X(i), Yv(v, mx), 2.6, 0, Math.PI * 2); ctx.fill(); });
+      };
+      drawLine(buckets.map((b) => b.nodes), maxN, COL_NODES);
+      drawLine(buckets.map((b) => b.edges), maxE, COL_EDGES);
+
+      // 悬停提示
+      canvas.onmousemove = (ev) => {
+        const rect = canvas.getBoundingClientRect();
+        const mx = ev.clientX - rect.left;
+        let i = n === 1 ? 0 : Math.round(((mx - padL) / iw) * (n - 1));
+        i = Math.max(0, Math.min(n - 1, i));
+        const b = buckets[i];
+        tip.style.display = "block";
+        tip.innerHTML = "<strong>" + b.label + "</strong>（UTC）<br>" +
+          "节点 <b style='color:" + COL_NODES + "'>" + b.nodes + "</b>（+" + b.new_nodes + "）　" +
+          "边 <b style='color:" + COL_EDGES + "'>" + b.edges + "</b>（+" + b.new_edges + "）<br>" +
+          "新增用户 " + b.new_users;
+        const tx = Math.min(Math.max(X(i) + 12, 4), W - 190);
+        const ty = Math.max(Yv(b.nodes, maxN) - 10, 4);
+        tip.style.left = tx + "px"; tip.style.top = ty + "px";
+      };
+      canvas.onmouseleave = () => { tip.style.display = "none"; };
+    }
+
+    function renderLegend(res) {
+      const items = [
+        { color: COL_NODES, text: "节点累计（左轴）" },
+        { color: COL_EDGES, text: "边累计（右轴）" },
+      ].concat((res.milestones || []).map((m) => ({ color: COL_MS[m.type] || "#c0c4cc", text: m.label })));
+      document.getElementById("curveLegend").innerHTML = items.map((it) =>
+        '<span><span class="dot" style="background:' + it.color + '"></span>' + it.text + "</span>"
+      ).join("");
+      document.getElementById("curveMeta").textContent =
+        "粒度 " + res.granularity + " · " + res.buckets.length + " 个桶 · UTC";
+    }
+
+    function renderMilestones(list) {
+      const box = document.getElementById("milestones");
+      if (!list || !list.length) { box.innerHTML = C.emptyState("⏱", "暂无事件"); return; }
+      box.innerHTML = '<div class="milestone-list">' + list.map((m) => {
+        let detail = "";
+        if (m.type === "first_user") detail = "用户 #" + m.user;
+        if (m.type === "first_edge") detail = "边 " + m.edge[0] + " — " + m.edge[1];
+        if (m.value != null) detail = "+" + m.value;
+        return '<div class="milestone-item">' +
+          '<span class="dot" style="background:' + (COL_MS[m.type] || "#c0c4cc") + ';display:inline-block;width:10px;height:10px;border-radius:50%"></span>' +
+          "<strong>" + m.label + "</strong><span class='mono'>" + m.time + "</span>" +
+          (detail ? '<span class="badge">' + detail + "</span>" : "") +
+          "</div>";
+      }).join("") + "</div>";
+    }
+
+    // ------------------------------------------------------------------
+    // 区间增量
+    // ------------------------------------------------------------------
+    function renderDelta(d) {
+      const tiles = [
+        { label: "新增用户", value: C.fmt(d.new_users), hint: "区间起点累计 " + d.at_start.users },
+        { label: "新增关系", value: C.fmt(d.new_edges), hint: "区间起点累计 " + d.at_start.edges },
+        { label: "新增节点", value: C.fmt(d.new_nodes), hint: "区间起点累计 " + d.at_start.nodes },
+        { label: "区间末累计", value: d.at_end.nodes + " / " + d.at_end.edges, hint: "节点 / 边" },
+      ];
+      let html = '<div class="grid cols-4">' + tiles.map((x) =>
+        '<div class="card stat-tile"><div class="label">' + x.label + '</div><div class="value" style="font-size:22px">' +
+        x.value + '</div><div class="hint">' + x.hint + "</div></div>").join("") + "</div>";
+
+      // 分桶增量条形图（与曲线同源，标签一致）
+      const buckets = d.buckets || [];
+      if (buckets.length) {
+        const maxV = Math.max.apply(null, buckets.map((b) => Math.max(b.new_users, b.new_edges)).concat([1]));
+        html += '<div class="card-title mt-16" style="font-size:13px">分桶增量（粒度 ' + d.granularity + "）</div>" +
+          '<div class="delta-bars">' + buckets.map((b) =>
+            '<div class="bar-row"><span class="bar-label">' + b.label + "</span>" +
+            '<span class="bar-track"><span class="bar-fill" style="width:' + (b.new_users / maxV * 100).toFixed(1) + "%;background:" + COL_NODES + '"></span></span>' +
+            '<span class="bar-val">+' + b.new_users + ' 用户</span></div>' +
+            '<div class="bar-row"><span class="bar-label"></span>' +
+            '<span class="bar-track"><span class="bar-fill" style="width:' + (b.new_edges / maxV * 100).toFixed(1) + "%;background:" + COL_EDGES + '"></span></span>' +
+            '<span class="bar-val">+' + b.new_edges + ' 关系</span></div>'
+          ).join("") + "</div>";
+      }
+      if (d.truncated) html += '<p class="muted mt-16">明细过长，仅展示前 1000 条。</p>';
+      document.getElementById("deltaResult").innerHTML = html;
+
+      // 明细列表
+      document.getElementById("deltaLists").style.display = "";
+      document.getElementById("newUserCount").textContent = "共 " + d.new_user_total + " 个";
+      document.getElementById("newEdgeCount").textContent = "共 " + d.new_edge_total + " 条";
+      C.renderTable(document.getElementById("newUsers"),
+        [{ key: "id", label: "ID" }, { key: "name", label: "姓名" }, { key: "time", label: "时间（UTC）" }],
+        d.new_user_list);
+      C.renderTable(document.getElementById("newEdges"),
+        [{ key: "from_name", label: "从" }, { key: "to_name", label: "到" }, { key: "time", label: "时间（UTC）" }],
+        d.new_edge_list);
+    }
+
+    function runDelta() {
+      const s = fromInputValue(document.getElementById("rangeStart").value);
+      const e = fromInputValue(document.getElementById("rangeEnd").value);
+      if (!s || !e || e <= s) { C.toast("请选择合法的起止时间（结束需晚于开始）", "warning"); return; }
+      api.timelineDelta({ start: s, end: e, granularity: document.getElementById("granularity").value })
+        .then(renderDelta)
+        .catch((err) => C.toast(err.message, "error"));
+    }
+
+    function fillFullRange() {
+      if (!CURVE || CURVE.totals.first_event == null) return;
+      const t = CURVE.totals;
+      const start = Math.floor(t.first_event / 60000) * 60000;
+      let end = Math.ceil((t.last_event + 1) / 60000) * 60000;
+      if (end <= t.last_event) end += 60000;   // 保证末事件落入左闭右开区间
+      document.getElementById("rangeStart").value = toInputValue(start);
+      document.getElementById("rangeEnd").value = toInputValue(end);
+    }
+
+    // ------------------------------------------------------------------
+    // 加载
+    // ------------------------------------------------------------------
+    function load() {
+      api.timeline({ granularity: document.getElementById("granularity").value })
+        .then((res) => {
+          CURVE = res;
+          renderTiles(res);
+          drawCurve();
+          renderLegend(res);
+          renderMilestones(res.milestones);
+          if (!document.getElementById("rangeStart").value) fillFullRange();
+        })
+        .catch((e) => C.toast(e.message, "error"));
+    }
+
+    C.initPage("timeline", function () {
+      document.getElementById("btnRefresh").addEventListener("click", load);
+      document.getElementById("granularity").addEventListener("change", () => {
+        load();
+        // 已展示的增量结果用新粒度同步刷新，保持口径一致
+        if (document.getElementById("deltaResult").innerHTML) runDelta();
+      });
+      document.getElementById("btnDelta").addEventListener("click", runDelta);
+      document.getElementById("btnFullRange").addEventListener("click", () => { fillFullRange(); runDelta(); });
+      // 主题切换 / 窗口缩放后重绘曲线颜色与尺寸
+      document.getElementById("themeToggle").addEventListener("click", () => setTimeout(drawCurve, 60));
+      let timer = null;
+      window.addEventListener("resize", () => { clearTimeout(timer); timer = setTimeout(drawCurve, 120); });
+      load();
+    });
+  </script>
+</body>
+</html>

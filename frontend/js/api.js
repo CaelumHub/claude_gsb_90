@@ -88,6 +88,8 @@
 
     // 统计 / 设置 / 标签
     stats: () => request("GET", "/api/stats"),
+    timeline: (p) => request("GET", "/api/timeline" + qs(p)),
+    timelineDelta: (p) => request("GET", "/api/timeline/delta" + qs(p)),
     settings: () => request("GET", "/api/settings"),
     saveSettings: (b) => request("PUT", "/api/settings", b),
     resetSettings: () => request("POST", "/api/settings/reset"),

@@ -57,8 +57,71 @@ def _check() -> int:
     rec = algorithms.hybrid_recommend(g, 1, k=3)
     assert "items" in rec
 
-    print("[check] OK: graph, bfs, pagerank, louvain, recommend all pass")
+    _check_timeline()
+
+    print("[check] OK: graph, bfs, pagerank, louvain, recommend, timeline all pass")
     return 0
+
+
+def _check_timeline() -> None:
+    """Pure-function checks for the evolution timeline (no disk involved)."""
+    from backend import timeline
+
+    # users: uid -> created ms (uid 4 has unknown time);
+    # edges: (u, v, ts) with a reversed duplicate and a self-loop.
+    events = timeline.events_from(
+        users={1: 1_000, 2: 2_000, 3: 5_000, 4: 0},
+        edges=[
+            (1, 2, 1_500),
+            (2, 1, 900),      # duplicate of (1,2) with earlier ts -> wins
+            (2, 3, 4_000),
+            (1, 3, 4_000),
+            (3, 3, 100),      # self-loop -> ignored
+        ],
+    )
+    # Dedup + earliest-ts semantics.
+    assert events["edges_total"] == 3, events["edges_total"]
+    assert [t for t, _a, _b in events["edge_events"]] == [900, 4_000, 4_000]
+    # Node first-seen = min(user created, first edge appearance).
+    assert events["node_first"][2] == 900  # edge (2,1,900) predates user ts 2000
+    assert events["nodes_total"] == 4 and events["nodes_without_time"] == 1
+
+    curve = timeline.build_curve(events, "day")
+    final = curve["buckets"][-1]
+    # Curve endpoint must equal the true (deduped) counts.
+    assert final["edges"] == 3 and final["users"] == 3 and final["nodes"] == 3
+    assert curve["totals"]["edges"] == 3 and curve["totals"]["users"] == 4
+
+    # Delta over the full span must match the curve increments exactly.
+    d = timeline.delta(events, 0, timeline.DAY_MS, "day")
+    assert d["new_edges"] == 3 and d["new_users"] == 3 and d["new_nodes"] == 3
+    assert sum(b["new_edges"] for b in curve["buckets"]) == d["new_edges"]
+    assert sum(b["new_users"] for b in curve["buckets"]) == d["new_users"]
+    # Mid-range delta is exact (not bucket-rounded): only events < 1000.
+    # Edge (2,1,900) makes both endpoints first-appear at t=900.
+    d2 = timeline.delta(events, 0, 1_000, "day")
+    assert d2["new_edges"] == 1 and d2["new_users"] == 0 and d2["new_nodes"] == 2
+
+    # Bucket alignment: week starts Monday 00:00 UTC, month starts on the 1st.
+    some_ts = 1_790_000_000_000
+    w = timeline._utc(timeline.bucket_start(some_ts, "week"))
+    assert w.weekday() == 0 and (w.hour, w.minute) == (0, 0)
+    m = timeline._utc(timeline.bucket_start(some_ts, "month"))
+    assert m.day == 1 and (m.hour, m.minute) == (0, 0)
+
+    # Reproducibility: identical input -> identical output (modulo generated_at).
+    c2 = timeline.build_curve(events, "day")
+    assert c2["buckets"] == curve["buckets"]
+    assert c2["milestones"] == curve["milestones"]
+    # Invalid inputs are rejected.
+    for bad in lambda: timeline.build_curve(events, "hourly"), \
+            lambda: timeline.delta(events, 100, 100):
+        try:
+            bad()
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError("expected ValueError")
 
 
 def main() -> int:

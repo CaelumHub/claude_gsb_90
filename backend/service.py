@@ -23,7 +23,7 @@ from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
 try:
-    from . import algorithms, config, storage
+    from . import algorithms, config, storage, timeline
     from .algorithms import (
         adamic_adar,
         bidirectional_shortest_path,
@@ -41,6 +41,7 @@ except ImportError:  # pragma: no cover
     import algorithms
     import config
     import storage
+    import timeline
     from algorithms import (  # type: ignore
         adamic_adar,
         bidirectional_shortest_path,
@@ -73,6 +74,9 @@ class SocialGraphService:
         self._rec_cache: Dict[int, dict] = self.derived.load_recommendations()
         self._community_dirty = False
         self._pagerank_dirty = False
+        # 时间线事件流缓存：磁盘扫描只做一次，曲线/增量/里程碑都复用它。
+        self._timeline_cache: Optional[dict] = None
+        self._timeline_dirty = True
 
     # ------------------------------------------------------------------
     # Graph access / caching
@@ -94,6 +98,7 @@ class SocialGraphService:
             self._graph_dirty = True
             self._community_dirty = False
             self._pagerank_dirty = True
+            self._timeline_dirty = True
 
     def graph_stats(self) -> dict:
         graph = self.get_graph()
@@ -119,6 +124,65 @@ class SocialGraphService:
             ],
             "isolated": degree_dist.get(0, 0),
         }
+
+    # ------------------------------------------------------------------
+    # Timeline (graph evolution)
+    # ------------------------------------------------------------------
+    def _timeline_events(self) -> dict:
+        """Return the cached event stream, rebuilding it when stale.
+
+        The event stream is the single source for every timeline view
+        (curve / delta / milestones), so those views are consistent by
+        construction and disk is scanned at most once per graph change.
+        """
+        with self._lock:
+            if self._timeline_cache is None or self._timeline_dirty:
+                self._timeline_cache = timeline.collect_events(self.store)
+                self._timeline_dirty = False
+            return self._timeline_cache
+
+    def get_timeline(self, granularity: str = "auto",
+                     start: Optional[int] = None, end: Optional[int] = None) -> dict:
+        return timeline.build_curve(self._timeline_events(), granularity, start, end)
+
+    def get_timeline_delta(self, start: int, end: int,
+                           granularity: str = "auto", limit: int = 1000) -> dict:
+        """Incremental stats for ``[start, end)`` plus display-ready lists.
+
+        Aggregation happens in :mod:`timeline`; here we only attach user
+        names and cap the detail lists (presentation concerns).
+        """
+        result = timeline.delta(self._timeline_events(), start, end, granularity)
+        users = self.store.load_users()
+
+        user_list = result.pop("new_user_list")
+        edge_list = result.pop("new_edge_list")
+        result["new_user_total"] = len(user_list)
+        result["new_edge_total"] = len(edge_list)
+        result["new_user_list"] = [
+            {
+                "id": uid,
+                "name": users.get(uid, {}).get("name", str(uid)),
+                "ts": ts,
+                "time": timeline.fmt_dt(ts),
+            }
+            for uid, ts in user_list[:limit]
+        ]
+        result["new_edge_list"] = [
+            {
+                "from": a,
+                "to": b,
+                "from_name": users.get(a, {}).get("name", str(a)),
+                "to_name": users.get(b, {}).get("name", str(b)),
+                "ts": ts,
+                "time": timeline.fmt_dt(ts),
+            }
+            for a, b, ts in edge_list[:limit]
+        ]
+        result["truncated"] = (
+            len(user_list) > limit or len(edge_list) > limit
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Users
@@ -228,6 +292,7 @@ class SocialGraphService:
         users[uid] = user
         self.store.save_users(users)
         self._register_tags(tags or [])
+        self._timeline_dirty = True  # 新用户是时间线上的事件
         return {"id": uid, **user}
 
     def update_user(self, uid: int, patch: dict) -> Optional[dict]:
@@ -253,10 +318,12 @@ class SocialGraphService:
             return False
         del users[uid]
         self.store.save_users(users)
-        # Remove incident edges: rebuild graph without this node.
+        # Remove incident edges: rebuild graph without this node.  Edge
+        # timestamps are carried through so the evolution timeline keeps
+        # its original history after the rewrite.
         edges = [
-            (u, v, w)
-            for u, v, w in self.store.iter_all_edges()
+            (u, v, w, ts)
+            for u, v, w, ts in self.store.iter_all_edges_with_ts()
             if u != uid and v != uid
         ]
         self._rewrite_all_edges(edges)

@@ -234,6 +234,20 @@ class GraphStore:
             for u, v, w, _ts in data["edges"]:
                 yield int(u), int(v), float(w)
 
+    def iter_all_edges_with_ts(self) -> Iterator[Tuple[int, int, float, int]]:
+        """Like :meth:`iter_all_edges` but also yields the creation timestamp.
+
+        Used by the timeline aggregation (``timeline.py``) and by the
+        delete-user rewrite path, which must preserve original edge times.
+        """
+        for shard_id in range(config.SHARD_COUNT):
+            data = _load_shard(shard_id)
+            for edge in data["edges"]:
+                u, v = int(edge[0]), int(edge[1])
+                w = float(edge[2]) if len(edge) > 2 else 1.0
+                ts = int(edge[3]) if len(edge) > 3 and edge[3] else 0
+                yield u, v, w, ts
+
     def neighborhood_graph(self, root: int, depth: int, limit: int) -> Graph:
         """Extract the induced subgraph around ``root`` up to ``depth`` hops."""
         g = Graph(directed=False)
@@ -280,24 +294,31 @@ class GraphStore:
         Strategy: buffer edges into per-shard pending lists, then flush each
         touched shard by merging pending edges with the existing edge list,
         sorting and deduplicating.  Returns import statistics.
+
+        Each edge may carry an optional 4th element ``ts`` (creation time in
+        ms); when omitted the current time is used.  Preserving caller-
+        supplied timestamps keeps the evolution timeline truthful across
+        full-graph rewrites (e.g. user deletion).
         """
-        pending: Dict[int, List[Tuple[int, int, float]]] = defaultdict(list)
+        pending: Dict[int, List[Tuple[int, int, float, int]]] = defaultdict(list)
         skipped = 0
         self_loops = 0
-        for u, v, w in edges:
-            u, v = int(u), int(v)
+        for e in edges:
+            u, v = int(e[0]), int(e[1])
             if u == v:
                 self_loops += 1
                 continue
+            w = float(e[2]) if len(e) > 2 else 1.0
+            ts = int(e[3]) if len(e) > 3 and e[3] else 0
             su = _user_shard(u)
-            pending[su].append((u, v, float(w)))
+            pending[su].append((u, v, w, ts))
 
         touched_shards: List[Tuple[int, int, int]] = []
         for shard_id, new_edges in pending.items():
             data = _load_shard(shard_id)
-            ts = config.now_ms()
-            for u, v, w in new_edges:
-                data["edges"].append([u, v, w, ts])
+            now = config.now_ms()
+            for u, v, w, ts in new_edges:
+                data["edges"].append([u, v, w, ts if ts > 0 else now])
                 data["users"].setdefault(str(u), {"name": str(u)})
                 data["users"].setdefault(str(v), {"name": str(v)})
             data["edges"].sort(key=lambda e: (e[0], e[1]))

@@ -1,8 +1,8 @@
 # 社交网络图分析与推荐系统
 
 一个 **零第三方依赖**（Python 后端纯标准库，前端仅引 vis.js CDN）的社交网络图分析
-与推荐系统。前端 10 个页面覆盖用户管理、关系导入、图可视化、路径与共同好友、
-社群发现、个性化推荐、统计面板、系统设置、数据导出与标签管理；后端实现邻接表图
+与推荐系统。前端 11 个页面覆盖用户管理、关系导入、图可视化、路径与共同好友、
+社群发现、个性化推荐、统计面板、演化分析、系统设置、数据导出与标签管理；后端实现邻接表图
 构建、BFS 最短路径、PageRank、Louvain 社群划分，以及协同过滤 + 图嵌入 + 标签的
 混合推荐。
 
@@ -46,6 +46,7 @@ gsb3/
 │   ├── graph.py                # 内存高效 CSR 图（邻接表冻结为压缩数组）
 │   ├── algorithms.py           # BFS/双向BFS、PageRank、Louvain、推荐算法
 │   ├── storage.py              # 分片 JSON 邻接表存储、索引、增量合并
+│   ├── timeline.py             # 图演化时间线：事件采集 + UTC 分桶聚合（纯函数）
 │   ├── service.py              # 业务服务层（缓存、CRUD、算法调度）
 │   ├── api.py                  # HTTP 服务 + REST 路由 + 静态托管
 │   ├── seed.py                 # 演示数据生成器
@@ -59,9 +60,10 @@ gsb3/
 │   ├── community.html          # 5. 社群发现（Louvain 着色）
 │   ├── recommend.html          # 6. 个性化推荐列表
 │   ├── stats.html              # 7. 统计面板
-│   ├── settings.html           # 8. 系统设置
-│   ├── export.html             # 9. 数据导出
-│   ├── tags.html               # 10. 标签管理
+│   ├── timeline.html           # 8. 演化分析（增长曲线 / 关键时间点 / 区间增量）
+│   ├── settings.html           # 9. 系统设置
+│   ├── export.html             # 10. 数据导出
+│   ├── tags.html               # 11. 标签管理
 │   ├── css/style.css           # 设计系统（明暗双主题）
 │   └── js/                     # api.js（客户端）+ common.js（外壳/工具）
 └── data/                       # 运行期生成（分片图、画像、推荐、社群…）
@@ -116,6 +118,18 @@ gsb3/
 `community.json` / `pagerank.json`）**分开存储**：图变更只触发图分片的增量写与索引
 刷新；推荐与社群结果作为缓存持久化，命中后零计算。
 
+### 5. 图演化时间线（`timeline.py`）
+
+- **聚合与展示分离**：`timeline.py` 只做「事件流 → 聚合结果」的纯计算；service
+  缓存事件流（图变更时失效），曲线、区间增量、关键时间点共用同一份聚合结果。
+- **时间口径统一**：全部为 Unix 毫秒；桶按 UTC 对齐（日 / ISO 周 / 自然月），
+  区间左闭右开 `[start, end)`；桶标签由后端生成，前端原样展示。
+- **与真实数据一致**：边按无向对去重取最早时间戳，曲线终点恒等于
+  `load_full_graph()` 的节点数 / 边数；区间增量用 bisect 在有序事件流上精确
+  计数，不按桶取整。
+- **可复现**：事件排序键 `(ts, id)`，相同输入必然产生相同输出；`--check`
+  内置一致性自测。
+
 ---
 
 ## REST API 摘要
@@ -135,6 +149,7 @@ gsb3/
 | GET | `/api/pagerank?top=` | PageRank 中心性 |
 | GET/POST | `/api/recommend/<id>` · `/api/recommend` | 单用户 / 批量推荐 |
 | GET | `/api/stats` | 统计面板聚合 |
+| GET | `/api/timeline` · `/api/timeline/delta` | 演化曲线（累计节点/边 + 关键时间点）· 区间增量统计 |
 | GET/PUT | `/api/settings` | 读取 / 保存设置 |
 | GET/POST/DELETE | `/api/tags` | 标签管理 |
 | GET | `/api/export?format=json\|graphml\|csv` | 导出 |
